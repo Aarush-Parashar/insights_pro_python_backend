@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from datetime import timedelta
 
 # ML Libraries
 from sklearn.model_selection import train_test_split
@@ -61,6 +62,14 @@ class PreprocessingConfig(BaseModel):
 class ModelSelectionResponse(BaseModel):
     model_names: Dict[str, str] # e.g. {"XGBoost": "92%"}
     prediction_input_data: List[Dict[str, Any]]
+
+class ForecastResponse(BaseModel):
+    title: str
+    time_label: str
+    value_label: str
+    historical: List[Dict[str, Any]] 
+    forecast: List[Dict[str, Any]]
+
 # ... (imports and supabase init) ...
 
 # --- Auth Models ---
@@ -81,6 +90,8 @@ class UploadResponse(BaseModel):
     file_id: str
     filename: str
     columns: List[str]
+
+    
 
 @app.post("/auth/signup", response_model=AuthResponse)
 async def signup(request: AuthRequest):
@@ -125,7 +136,7 @@ async def login(request: AuthRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail="Login failed. Check credentials.")
 
-# ... (rest of the file: get_current_user, upload, predict, etc) ...
+
 # --- Dependency: Auth & User Context ---
 async def get_current_user(authorization: Optional[str] = Header(None)):
     """
@@ -154,7 +165,7 @@ async def list_user_files(user: Any = Depends(get_current_user)):
         # List files in the user's folder
         res = supabase.storage.from_("datasets").list(path=user.id)
         
-        # Extract filenames (ignore hidden files/folders)
+        # Extract filenames 
         filenames = [f['name'] for f in res if not f['name'].startswith('.')]
         return {"files": filenames}
     except Exception as e:
@@ -541,4 +552,120 @@ async def visualize_data(file_path: str, config: PreprocessingConfig, user: Any 
         "x_label": x_col,
         "y_label": target,
         "data": data_points
+    }
+
+# --- Helper: Auto-Detect Date Column ---
+def detect_date_column(df: pd.DataFrame) -> str:
+    # 1. Check for columns with "date", "time", "year" in the name
+    candidates = [c for c in df.columns if "date" in c.lower() or "time" in c.lower() or "year" in c.lower()]
+    
+    # 2. Try to convert candidates to datetime objects
+    for col in candidates:
+        try:
+            pd.to_datetime(df[col], errors='raise')
+            return col
+        except:
+            continue
+            
+    # 3. If no obvious name, check ALL object/string columns
+    object_cols = df.select_dtypes(include=['object']).columns
+    for col in object_cols:
+        try:
+            # If >80% of rows parse as valid dates, assume it is a date column
+            if pd.to_datetime(df[col], errors='coerce').notna().mean() > 0.8:
+                return col
+        except:
+            continue
+            
+    return None
+
+# 6. Forecast (Time-Series Prediction)
+@app.post("/forecast/{file_path:path}", response_model=ForecastResponse)
+async def get_forecast(file_path: str, config: PreprocessingConfig, user: Any = Depends(get_current_user)):
+    """
+    1. Detects a Date column.
+    2. Aggregates data by Date (Daily/Monthly).
+    3. Trains a model (Random Forest) to learn the trend.
+    4. Predicts the next 30 periods.
+    """
+    df = get_dataframe_from_storage(file_path)
+    target = config.target_variable
+    
+    # A. Detect Date Column
+    date_col = detect_date_column(df)
+    if not date_col:
+        raise HTTPException(status_code=400, detail="No date/time column detected in this dataset. Forecast requires a time column.")
+
+    # B. Preprocess Data
+    try:
+        # Convert to datetime
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df = df.dropna(subset=[date_col, target]) # Drop bad dates/values
+        
+        # Sort by date
+        df = df.sort_values(by=date_col)
+        
+        # Aggregate duplicates (e.g. multiple sales on same day -> sum them)
+        # We assume if target is numeric, we sum it. If it's a rate, we might want mean, but sum is safer for "Sales".
+        df_grouped = df.groupby(date_col)[target].sum().reset_index()
+        
+        if len(df_grouped) < 5:
+             raise HTTPException(status_code=400, detail="Not enough historical data points to forecast (need at least 5).")
+
+    except Exception as e:
+         raise HTTPException(status_code=400, detail=f"Data preparation failed: {e}")
+
+    # C. Feature Engineering for ML (Convert Date -> Numbers)
+    # We use "Days since start" as the feature to predict trend
+    start_date = df_grouped[date_col].min()
+    df_grouped['days_since'] = (df_grouped[date_col] - start_date).dt.days
+    
+    X = df_grouped[['days_since']]
+    y = df_grouped[target]
+    
+    # D. Train Forecaster
+    # We use Random Forest because it handles non-linear trends better than Linear Regression
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X, y)
+    
+    # E. Generate Future Dates (Next 30 Steps)
+    last_days_since = df_grouped['days_since'].max()
+    # Try to detect frequency (approximate)
+    avg_diff = df_grouped['days_since'].diff().mean() 
+    step_size = max(1, int(round(avg_diff if not np.isnan(avg_diff) else 1)))
+    
+    future_days = []
+    future_dates = []
+    
+    last_date = df_grouped[date_col].max()
+    
+    for i in range(1, 31): # Forecast 30 steps ahead
+        next_day_idx = last_days_since + (i * step_size)
+        future_days.append([next_day_idx])
+        future_dates.append(last_date + timedelta(days=int(i * step_size)))
+        
+    # Predict
+    future_preds = model.predict(future_days)
+    
+    # F. Format Response
+    historical_data = []
+    for _, row in df_grouped.iterrows():
+        historical_data.append({
+            "date": row[date_col].strftime("%Y-%m-%d"),
+            "value": float(row[target])
+        })
+        
+    forecast_data = []
+    for date_val, pred_val in zip(future_dates, future_preds):
+        forecast_data.append({
+            "date": date_val.strftime("%Y-%m-%d"),
+            "value": float(pred_val)
+        })
+
+    return {
+        "title": f"30-Period Forecast for {target}",
+        "time_label": date_col,
+        "value_label": target,
+        "historical": historical_data,
+        "forecast": forecast_data
     }
