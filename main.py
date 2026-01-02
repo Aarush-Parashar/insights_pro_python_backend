@@ -44,7 +44,7 @@ app = FastAPI(
 )
 
 # CORS
-origins = ["*"]  # Restrict this to your Flutter domain in production
+origins = ["*"]  
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
