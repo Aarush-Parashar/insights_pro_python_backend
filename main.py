@@ -2,6 +2,7 @@ import os
 import io
 import json
 import joblib
+import gc  # <--- ADDED: For memory management
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional
@@ -70,9 +71,6 @@ class ForecastResponse(BaseModel):
     historical: List[Dict[str, Any]] 
     forecast: List[Dict[str, Any]]
 
-# ... (imports and supabase init) ...
-
-# --- Auth Models ---
 class AuthRequest(BaseModel):
     email: str
     password: str
@@ -81,7 +79,6 @@ class AuthResponse(BaseModel):
     user_id: str
     token: str
     is_first_time_user: bool = False
-# --- Add these to your existing main.py ---
 
 class FileListResponse(BaseModel):
     files: List[str]
@@ -91,7 +88,7 @@ class UploadResponse(BaseModel):
     filename: str
     columns: List[str]
 
-    
+# --- Auth Endpoints ---
 
 @app.post("/auth/signup", response_model=AuthResponse)
 async def signup(request: AuthRequest):
@@ -104,8 +101,6 @@ async def signup(request: AuthRequest):
         
         # 2. Check for errors or missing user
         if not res.user:
-             # If "Confirm Email" is ON in Supabase, user is None until clicked.
-             # If OFF, user is returned immediately.
              raise HTTPException(status_code=400, detail="Signup failed. check email confirmation settings.")
 
         # 3. Return success
@@ -149,7 +144,6 @@ async def get_current_user(authorization: Optional[str] = Header(None)):
     token = authorization.replace("Bearer ", "")
     
     try:
-        # Supabase-py uses the token to get the user
         response = supabase.auth.get_user(token)
         if not response.user:
              raise HTTPException(status_code=401, detail="Invalid Token")
@@ -162,10 +156,7 @@ async def get_current_user(authorization: Optional[str] = Header(None)):
 async def list_user_files(user: Any = Depends(get_current_user)):
     """Lists all files in the user's storage folder."""
     try:
-        # List files in the user's folder
         res = supabase.storage.from_("datasets").list(path=user.id)
-        
-        # Extract filenames 
         filenames = [f['name'] for f in res if not f['name'].startswith('.')]
         return {"files": filenames}
     except Exception as e:
@@ -175,7 +166,6 @@ async def list_user_files(user: Any = Depends(get_current_user)):
 # --- Helper: Download Data from Supabase ---
 def get_dataframe_from_storage(file_path: str) -> pd.DataFrame:
     try:
-        # Download file bytes from Supabase 'datasets' bucket
         response = supabase.storage.from_("datasets").download(file_path)
         return pd.read_csv(io.BytesIO(response))
     except Exception as e:
@@ -195,17 +185,12 @@ async def upload_file(file: UploadFile = File(...), user: Any = Depends(get_curr
     
     try:
         contents = await file.read()
-        
-        # Verify it's a valid CSV before saving
         try:
             df = pd.read_csv(io.BytesIO(contents))
         except:
             raise HTTPException(status_code=400, detail="Invalid CSV content")
 
-        # Save to Supabase Storage
         file_path = f"{user.id}/{file.filename}"
-        
-        # 'upsert' allows overwriting if user uploads same file again
         supabase.storage.from_("datasets").upload(
             file_path, 
             contents, 
@@ -213,7 +198,7 @@ async def upload_file(file: UploadFile = File(...), user: Any = Depends(get_curr
         )
         
         return {
-            "file_id": file_path, # We use the storage path as ID
+            "file_id": file_path,
             "filename": file.filename,
             "columns": df.columns.tolist()
         }
@@ -222,12 +207,9 @@ async def upload_file(file: UploadFile = File(...), user: Any = Depends(get_curr
 
 @app.get("/data/load/{filename}", response_model=UploadResponse)
 async def load_existing_file(filename: str, user: Any = Depends(get_current_user)):
-    """Loads metadata (columns) for an existing file so the user can switch to it."""
     file_path = f"{user.id}/{filename}"
     try:
-        # Reuse the helper to download and read columns
         df = get_dataframe_from_storage(file_path)
-        
         return {
             "file_id": file_path,
             "filename": filename,
@@ -239,7 +221,6 @@ async def load_existing_file(filename: str, user: Any = Depends(get_current_user
 # 2. Predict - Step 1: Preprocessing Questions (Static Config)
 @app.get("/predict/questions")
 async def get_predict_questions():
-    # Matches the PDF workflow
     return [
         {"key": "categorical_check", "question": "Does your dataset contain categorical columns?", "type": "radio", "options": ["Yes", "No"]},
         {"key": "num_missing_values", "question": "Numerical Missing Values Strategy", "type": "dropdown", "options": ["Mean", "Median", "Drop"]},
@@ -262,23 +243,27 @@ async def ai_model_selection(file_path: str, config: PreprocessingConfig, user: 
     
     # A. Load Data
     df = get_dataframe_from_storage(file_path)
+    
+    # --- OPTIMIZATION: Cap data size for Render Free Tier ---
+    if len(df) > 5000:
+        df = df.sample(n=5000, random_state=42)
+    # -------------------------------------------------------
+
     target = config.target_variable
     
     if target not in df.columns:
         raise HTTPException(status_code=400, detail="Target variable not found in dataset")
-    initial_count = len(df)
+    
     df = df.dropna(subset=[target])
     
     if len(df) == 0:
          raise HTTPException(status_code=400, detail="Target variable column is completely empty.")
-    # --- FIX END ---
 
     # B. Separate X and y
     X = df.drop(columns=[target])
     y = df[target]
 
-    # C. Detect Problem Type (Regression or Classification)
-    # Heuristic: If target is object or low cardinality numeric, it's classification
+    # C. Detect Problem Type
     is_classification = False
     if y.dtype == 'object' or (y.nunique() < 20 and pd.api.types.is_integer_dtype(y)):
         is_classification = True
@@ -297,9 +282,8 @@ async def ai_model_selection(file_path: str, config: PreprocessingConfig, user: 
     ])
 
     # 2. Categorical Transformer
-    cat_strategy = "most_frequent" # "Mode"
+    cat_strategy = "most_frequent"
     
-    # Decide Encoder
     if config.config.get("encoding") == "One-Hot":
         encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
     else:
@@ -315,37 +299,31 @@ async def ai_model_selection(file_path: str, config: PreprocessingConfig, user: 
             ('num', numeric_transformer, numeric_features),
             ('cat', categorical_transformer, categorical_features)
         ])
-
   
     # E. Train Models
-    
     le = None
     if is_classification:
         le = LabelEncoder()
-        # Fit on the entire dataset 'y' first
         y = le.fit_transform(y) 
     
-    # NOW split the data
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # (Remove the old 'if is_classification' block that was here)
-
-    # Define candidate models
+    # --- OPTIMIZATION: Reduced Complexity & Single Threaded ---
     if is_classification:
         models = {
-            "Logistic Regression": LogisticRegression(max_iter=1000),
-            "Random Forest": RandomForestClassifier(n_estimators=100),
-            "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss'),
-            "SVM": SVC(probability=True)
+            "Logistic Regression": LogisticRegression(max_iter=1000, n_jobs=1),
+            "Random Forest": RandomForestClassifier(n_estimators=30, max_depth=10, n_jobs=1),
+            "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=30, max_depth=6, n_jobs=1),
+            "SVM": SVC(probability=True) 
         }
     else:
-        # ... (rest of the regression models remain the same)
         models = {
-            "Linear Regression": LinearRegression(),
-            "Random Forest": RandomForestRegressor(n_estimators=100),
-            "XGBoost": XGBRegressor(),
+            "Linear Regression": LinearRegression(n_jobs=1),
+            "Random Forest": RandomForestRegressor(n_estimators=30, max_depth=10, n_jobs=1),
+            "XGBoost": XGBRegressor(n_estimators=30, max_depth=6, n_jobs=1),
             "SVM": SVR()
         }
+    # --------------------------------------------------------
 
     results = {}
     best_score = -1
@@ -355,7 +333,6 @@ async def ai_model_selection(file_path: str, config: PreprocessingConfig, user: 
     # Train Loop
     for name, model in models.items():
         try:
-            # Create full pipeline: Preprocessor -> Model
             clf = Pipeline(steps=[('preprocessor', preprocessor),
                                   ('classifier', model)])
             
@@ -369,24 +346,27 @@ async def ai_model_selection(file_path: str, config: PreprocessingConfig, user: 
                 score = r2_score(y_test, preds)
                 results[name] = f"{score*100:.1f}%"
             
-            # Track best model
             if score > best_score:
                 best_score = score
                 best_model_name = name
                 best_pipeline = clf
-                
+            
+            # --- OPTIMIZATION: Free memory immediately ---
+            if clf != best_pipeline:
+                del clf
+            
         except Exception as e:
-            # If a model fails (like XGBoost strictness), log it and continue
             print(f"Model {name} failed to train: {e}")
             results[name] = "N/A (Data Error)"
+        
+        # --- OPTIMIZATION: Force GC ---
+        gc.collect()
 
-    # Check if we have at least one working model
     if best_pipeline is None:
         raise HTTPException(status_code=400, detail="All models failed to train on this data.")
 
 
-    # F. Save BEST Model to Supabase (for Step 3)
-    # We serialize the entire pipeline (including preprocessor)
+    # F. Save BEST Model to Supabase
     model_artifact = {
         "pipeline": best_pipeline,
         "is_classification": is_classification,
@@ -406,14 +386,10 @@ async def ai_model_selection(file_path: str, config: PreprocessingConfig, user: 
     model_path = f"{user.id}/{file_path.split('/')[-1]}_model.joblib"
     supabase.storage.from_("models").upload(model_path, buffer.getvalue(), file_options={"upsert": "true"})
 
-    # G. Generate Dynamic Input Fields for Frontend
-    # Based on the PDF, return fields so user can input data for prediction
+    # G. Generate Dynamic Input Fields
     input_fields = []
-    
-    # Add Dropdowns for Categorical
     for col in categorical_features:
         unique_vals = X[col].dropna().unique().tolist()
-        # Limit dropdown size for UI sanity
         input_fields.append({
             "name": col,
             "inputtype": "Dropdown",
@@ -421,7 +397,6 @@ async def ai_model_selection(file_path: str, config: PreprocessingConfig, user: 
             "placeholder": f"Select {col}"
         })
         
-    # Add Number Inputs
     for col in numeric_features:
         input_fields.append({
             "name": col,
@@ -431,11 +406,8 @@ async def ai_model_selection(file_path: str, config: PreprocessingConfig, user: 
             "max": float(X[col].max())
         })
 
-    # Sort results by accuracy (descending)
-# --- FIX START: Safe Sorting Helper ---
     def get_score_value(item):
         name, score_str = item
-        # If the model failed (N/A), give it a score of -1 so it goes to the bottom
         if "N/A" in score_str:
             return -1.0
         try:
@@ -443,9 +415,8 @@ async def ai_model_selection(file_path: str, config: PreprocessingConfig, user: 
         except:
             return -1.0
 
-    # Sort using the helper
     sorted_results = dict(sorted(results.items(), key=get_score_value, reverse=True))
-    # --- FIX END ---
+    
     return ModelSelectionResponse(
         model_names=sorted_results,
         prediction_input_data=input_fields
@@ -454,13 +425,9 @@ async def ai_model_selection(file_path: str, config: PreprocessingConfig, user: 
 # 4. Predict - Step 3: Get Result
 @app.post("/predict/result/{file_path:path}")
 async def get_prediction_result(file_path: str, input_data: Dict[str, Any], user: Any = Depends(get_current_user)):
-    """
-    Loads the saved model from Storage and runs inference.
-    """
     model_path = f"{user.id}/{file_path.split('/')[-1]}_model.joblib"
     
     try:
-        # Download Model
         response = supabase.storage.from_("models").download(model_path)
         artifact = joblib.load(io.BytesIO(response))
         
@@ -468,20 +435,16 @@ async def get_prediction_result(file_path: str, input_data: Dict[str, Any], user
         is_class = artifact["is_classification"]
         le = artifact["label_encoder"]
         
-        # Convert input dict to DataFrame
         input_df = pd.DataFrame([input_data])
         
-        # Predict
         prediction = pipeline.predict(input_df)
         result_val = prediction[0]
         
-        confidence_str = "N/A" # Default for regression
+        confidence_str = "N/A" 
 
-        # Decode label if classification & try to get probability
         if is_class:
             if hasattr(pipeline, "predict_proba"):
                 try:
-                    # Get probability of the predicted class
                     probs = pipeline.predict_proba(input_df)
                     max_prob = np.max(probs)
                     confidence_str = f"{max_prob*100:.2f}%"
@@ -493,7 +456,6 @@ async def get_prediction_result(file_path: str, input_data: Dict[str, Any], user
             
         return {
             "prediction": str(result_val),
-            # FIX: Added the 'confidence' field required by Flutter
             "confidence": confidence_str,
             "model_used": "Best Performer (Auto-Selected)",
             "status": "success"
@@ -501,22 +463,18 @@ async def get_prediction_result(file_path: str, input_data: Dict[str, Any], user
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
-# 5. Visualize (Safer Numeric-Only Version)
+
+# 5. Visualize
 @app.post("/visualize/{file_path:path}")
 async def visualize_data(file_path: str, config: PreprocessingConfig, user: Any = Depends(get_current_user)):
     df = get_dataframe_from_storage(file_path)
     target = config.target_variable
     
-    # Filter for numeric columns only (float/int)
     numeric_cols = df.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
     
-    # Remove target from X options if present
     if target in numeric_cols:
         numeric_cols.remove(target)
     
-    # DECISION LOGIC:
-    # 1. If we have other numeric columns, pick the first one as 'X'.
-    # 2. If NO other numeric columns exist, use the Row Index (0, 1, 2...) as 'X'.
     if len(numeric_cols) > 0:
         x_col = numeric_cols[0]
         use_index = False
@@ -524,25 +482,22 @@ async def visualize_data(file_path: str, config: PreprocessingConfig, user: Any 
         x_col = "Row Index"
         use_index = True
 
-    # Limit to 100 points for performance
     sample = df.sample(min(100, len(df))).fillna(0)
     
     data_points = []
     for idx, row in sample.iterrows():
-        # Ensure 'y' is a number (handle bad data)
         try:
             y_val = float(row[target])
         except:
             y_val = 0.0
 
-        # Ensure 'x' is a number
         if use_index:
             x_val = float(idx)
         else:
             try:
                 x_val = float(row[x_col])
             except:
-                x_val = float(idx) # Fallback to index if column has bad data
+                x_val = float(idx)
                 
         data_points.append({"x": x_val, "y": y_val})
         
@@ -556,57 +511,36 @@ async def visualize_data(file_path: str, config: PreprocessingConfig, user: Any 
 
 # --- Helper: Auto-Detect Date Column ---
 def detect_date_column(df: pd.DataFrame) -> str:
-    # 1. Check for columns with "date", "time", "year" in the name
     candidates = [c for c in df.columns if "date" in c.lower() or "time" in c.lower() or "year" in c.lower()]
-    
-    # 2. Try to convert candidates to datetime objects
     for col in candidates:
         try:
             pd.to_datetime(df[col], errors='raise')
             return col
         except:
             continue
-            
-    # 3. If no obvious name, check ALL object/string columns
     object_cols = df.select_dtypes(include=['object']).columns
     for col in object_cols:
         try:
-            # If >80% of rows parse as valid dates, assume it is a date column
             if pd.to_datetime(df[col], errors='coerce').notna().mean() > 0.8:
                 return col
         except:
             continue
-            
     return None
 
-# 6. Forecast (Time-Series Prediction)
+# 6. Forecast
 @app.post("/forecast/{file_path:path}", response_model=ForecastResponse)
 async def get_forecast(file_path: str, config: PreprocessingConfig, user: Any = Depends(get_current_user)):
-    """
-    1. Detects a Date column.
-    2. Aggregates data by Date (Daily/Monthly).
-    3. Trains a model (Random Forest) to learn the trend.
-    4. Predicts the next 30 periods.
-    """
     df = get_dataframe_from_storage(file_path)
     target = config.target_variable
     
-    # A. Detect Date Column
     date_col = detect_date_column(df)
     if not date_col:
         raise HTTPException(status_code=400, detail="No date/time column detected in this dataset. Forecast requires a time column.")
 
-    # B. Preprocess Data
     try:
-        # Convert to datetime
         df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-        df = df.dropna(subset=[date_col, target]) # Drop bad dates/values
-        
-        # Sort by date
+        df = df.dropna(subset=[date_col, target])
         df = df.sort_values(by=date_col)
-        
-        # Aggregate duplicates (e.g. multiple sales on same day -> sum them)
-        # We assume if target is numeric, we sum it. If it's a rate, we might want mean, but sum is safer for "Sales".
         df_grouped = df.groupby(date_col)[target].sum().reset_index()
         
         if len(df_grouped) < 5:
@@ -615,22 +549,19 @@ async def get_forecast(file_path: str, config: PreprocessingConfig, user: Any = 
     except Exception as e:
          raise HTTPException(status_code=400, detail=f"Data preparation failed: {e}")
 
-    # C. Feature Engineering for ML (Convert Date -> Numbers)
-    # We use "Days since start" as the feature to predict trend
     start_date = df_grouped[date_col].min()
     df_grouped['days_since'] = (df_grouped[date_col] - start_date).dt.days
     
     X = df_grouped[['days_since']]
     y = df_grouped[target]
     
-    # D. Train Forecaster
-    # We use Random Forest because it handles non-linear trends better than Linear Regression
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    # --- OPTIMIZATION: Restricted n_jobs ---
+    model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=1)
+    # ---------------------------------------
+    
     model.fit(X, y)
     
-    # E. Generate Future Dates (Next 30 Steps)
     last_days_since = df_grouped['days_since'].max()
-    # Try to detect frequency (approximate)
     avg_diff = df_grouped['days_since'].diff().mean() 
     step_size = max(1, int(round(avg_diff if not np.isnan(avg_diff) else 1)))
     
@@ -639,15 +570,13 @@ async def get_forecast(file_path: str, config: PreprocessingConfig, user: Any = 
     
     last_date = df_grouped[date_col].max()
     
-    for i in range(1, 31): # Forecast 30 steps ahead
+    for i in range(1, 31): 
         next_day_idx = last_days_since + (i * step_size)
         future_days.append([next_day_idx])
         future_dates.append(last_date + timedelta(days=int(i * step_size)))
         
-    # Predict
     future_preds = model.predict(future_days)
     
-    # F. Format Response
     historical_data = []
     for _, row in df_grouped.iterrows():
         historical_data.append({
